@@ -1,0 +1,502 @@
+---
+title: '510 Project: Predicting Flight Delays'
+author: "Shune Kawaoto"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Motivation
+
+As the holiday season approaches, it is common for many people to travel, whether it be for visiting friends and family or for vacation. One method of long distance travel is through flying, and it would be great if flights can accurately be predicted to have a delayed arrival.
+
+We chose to predict arrival delay rather than departure delay because:
+
+1.  Arrival time is more important when transferring flights is required, especially with short layover times.
+2.  Accommodations like hotels, hostels, and Airbnbs may only allow guests to check in within a certain time window and a delayed arrival can determine whether the guests get there in time.
+3.  After flying, some locations may require a shuttle, bus, or even train in order to leave the airport, and it is possible that a plane can arrive after these services are no longer running.
+
+It is also possible for flight situations to change: while the aircraft can leave the gate on time (and therefore classified as an on-time departure) it is possible that the plane can be delayed during the taxi and takeoff process. The opposite is also true where a flight can have a delayed departure but arrive on time. Because of this last point, we are taking the perspective of a passenger during a flight who wants to predict whether or not the plane we're on will have a delayed arrival.
+
+# Importing Libraries & Data
+
+A quick note is that we obtained this data from Kaggle, and it records domestic flight data in the U.S. from 2019 - 2023.
+
+```{r}
+install.packages('ggcorrplot')
+library(ggcorrplot)
+library(MASS)
+library(car)
+library(skimr)
+library(tidyverse)
+library(caret)
+library(glmnet)
+
+flights_full <- read.csv("flights_sample_3m.csv")
+```
+
+# EDA & Data Cleaning
+
+```{r}
+head(flights_full)
+skim(flights_full)
+```
+
+One thing that we noticed is that some variables like FL_DATE, AIRLINE, ..., and DIVERTED (see code below) were incorrectly encoded as characters and numeric values. We converted these to factors as our first step. The second thing we want to point out is that our response variable ARR_DELAY is a numeric, continuous value. Because we want to predict whether the flight is delayed or not, we changed ARR_DELAY to be a binary factor variable, where all values greater than 0 are considered "delayed", denoted as 1, and less than equal to 0 are considered "not delayed", denoted as 0.
+
+```{r}
+flights_full$FL_DATE <- as.factor(as.character(flights_full$FL_DATE))
+flights_full$AIRLINE <- as.factor(flights_full$AIRLINE)
+flights_full$AIRLINE_DOT <- as.factor(flights_full$AIRLINE_DOT)
+flights_full$AIRLINE_CODE <- as.factor(flights_full$AIRLINE_CODE)
+flights_full$DOT_CODE <- as.factor(flights_full$DOT_CODE)
+flights_full$FL_NUMBER <- as.factor(flights_full$FL_NUMBER)
+flights_full$ORIGIN <- as.factor(flights_full$ORIGIN)
+flights_full$ORIGIN_CITY <- as.factor(flights_full$ORIGIN_CITY)
+flights_full$DEST <- as.factor(flights_full$DEST)
+flights_full$DEST_CITY <- as.factor(flights_full$DEST_CITY)
+flights_full$CANCELLED <- as.factor(as.character(flights_full$CANCELLED))
+flights_full$CANCELLATION_CODE <- as.factor(flights_full$CANCELLATION_CODE)
+flights_full$DIVERTED <- as.factor(as.character(flights_full$DIVERTED))
+
+flights_full$DELAYED <- as.factor(ifelse(flights_full$ARR_DELAY > 0, 1, 0))
+
+flights <- flights_full %>% dplyr::select(-ARR_DELAY)
+# delayed = 1, early or on-time = 0
+```
+
+The second thing we decided to do was to delete all variables that we didn't need:
+
+-   AIRLINE_DOT, AIRLINE_CODE, and DOT_CODE all were unique identifiers for every specific airline, so we decided to keep AIRLINE and delete these three variables instead.
+
+-   ORIGIN_CITY & DEST_CITY were locations that airports are in, so they overlap quite a lot with ORIGIN and DEST, which gives us the airport codes. Since we are more concerned with where the planes depart and arrive, which is the airport itself, we decided to delete ORIGIN_CITY & DEST_CITY.
+
+-   If flights are cancelled, then there is no possible way for flights to depart in the first place, so there is no arrival data. Therefore, because we are trying to predict arrival data, we deleted CANCELLED and CANCELLATION_CODE.
+
+-   We are taking the perspective of someone who is midflight and wants to predict if their plane will arrive on time. Therefore, we can only use data that we know prior to being airborne. Using this condtion, these following variables were also removed:
+
+    -   WHEELS_ON is the time when the plane lands (wheels touch the floor).
+
+    -   TAXI_IN is the time between landing and being taxied to the arrival gate.
+
+    -   ARR_TIME is the recorded arrival time, not the scheduled arrival time.
+
+    -   ELAPSED_TIME is the recorded time of how long the flight took.
+
+    -   AIR_TIME is the recorded time of how long the plane was airborne.
+
+    -   DELAY_DUE_CARRIER is how many minutes the departure and arrival delay was attributed to the plane.
+
+    -   DELAY_DUE_WEATHER is how many minutes the departure and arrival delay was attributed to the weather.
+
+    -   DELAY_DUE_NAS is how many minutes the departure and arrival delay was attributed to the NAS (National Airspace System).
+
+    -   DELAY_DUE_SECURITY is how many minutes the departure and arrival delay was attributed to security issues and protocols.
+
+    -   DELAY_DUE_LATE_AIRCRAFT is how many minutes the departure and arrival delay was attributed to the aircraft arriving late prior to departure.
+
+```{r}
+flights <- flights %>%
+  dplyr::select(-c(AIRLINE_DOT, AIRLINE_CODE, DOT_CODE, ORIGIN_CITY, DEST_CITY, WHEELS_ON, 
+                   TAXI_IN, ARR_TIME, CANCELLED, CANCELLATION_CODE, ELAPSED_TIME, AIR_TIME,
+                   DELAY_DUE_CARRIER, DELAY_DUE_WEATHER, DELAY_DUE_NAS, DELAY_DUE_SECURITY,
+                   DELAY_DUE_LATE_AIRCRAFT))
+```
+
+The next step is to change FL_DATE. It was imported in the yyyy-mm-dd format, and we decided to change that to three separate variables YEAR, MONTH, and DAY instead. Since the flight data is from 2019 - 2023, we believe that the COVID-19 pandemic could've had a possible effect on the flights. It is also important to note that in the airline industry, days of the week are considered more important than days of the month. Therefore, we encoded YEAR and DAY as factors, with levels ("2019", "2020", "2021", "2022", "2023") and ("Sunday", "Monday", "Tuesday", "Wednesday". "Thursday", "Friday", "Saturday"), respectively.
+
+```{r}
+day_of_week <- weekdays(as.Date(as.character(flights$FL_DATE), format = "%Y-%m-%d"))
+
+# Making FL_DATE into three separate columns: Year, Month, Day of the Week
+flights <- flights %>%
+  separate(col = FL_DATE, into = c("YEAR", "MONTH", "DAY"), sep = "-", convert = TRUE) 
+  
+# COVID-19 happened in this time span so I will be making YEAR a categorical variable.
+flights$YEAR <- as.factor(flights$YEAR)
+
+flights$DAY <- as.factor(day_of_week)
+```
+
+The following variables are numeric and have been recorded in the "hhmm" form, which doesn't really make sense for our analysis. Therefore we are changing them into "minutes after midnight".
+
+-   CRS_DEP_TIME is the scheduled departure time.
+-   CRS_ARR_TIME is the scheduled arrival time.
+-   DEP_TIME is the recorded departure time.
+-   WHEELS_OFF is the recorded time when the flight takes off (wheels leave the floor).
+
+```{r}
+# CRS_DEP_TIME, CRS_ARR_TIME, DEP_TIME, WHEELS_OFF have to be converted
+# into numeric values that make sense (same format as CRS_ELAPSED_TIME).
+# 
+# Solution: I will make them into minutes after midnight.
+hours_crs_dep <- floor(flights$CRS_DEP_TIME / 100)
+mins_crs_dep <- flights$CRS_DEP_TIME %% 100
+flights$CRS_DEP_TIME <- hours_crs_dep * 60 + mins_crs_dep
+
+hours_crs_arr <- floor(flights$CRS_ARR_TIME / 100)
+mins_crs_arr <- flights$CRS_ARR_TIME %% 100
+flights$CRS_ARR_TIME <- hours_crs_arr * 60 + mins_crs_arr
+
+hours_dep <- floor(flights$DEP_TIME / 100)
+mins_dep <- flights$DEP_TIME %% 100
+flights$DEP_TIME <- hours_dep * 60 + mins_dep
+
+hours_off <- floor(flights$WHEELS_OFF / 100)
+mins_off <- flights$WHEELS_OFF %% 100
+flights$WHEELS_OFF <- hours_off * 60 + mins_off
+```
+
+We believe the data is clean enough to starting creating visualizations at this point to better understand the data. We first remove all observations that contain NA and then create a correlation heat map and histograms for our numeric variables, and create bar graphs for our categorical variables. The heat map will tell us the relationships between the variables, and the histograms will give us a clear view about the distribution of the data. The bar graphs will give us a picture of the frequencies of each category in the variables.
+
+```{r}
+flights <- na.omit(flights)
+
+# Correlation plot (numeric)
+ggcorrplot(cor(flights[, sapply(flights, is.numeric)]), method = "square")
+
+# Histograms (numeric)
+ggplot(flights, aes(x = CRS_DEP_TIME)) + geom_histogram(bins = 100) + theme_minimal()
+ggplot(flights, aes(x = CRS_ARR_TIME)) + geom_histogram(bins = 100) + theme_minimal()
+ggplot(flights, aes(x = CRS_ELAPSED_TIME)) + geom_histogram(bins = 100) + theme_minimal()
+ggplot(flights, aes(x = DISTANCE)) + geom_histogram(bins = 100) + theme_minimal()
+ggplot(flights, aes(x = DEP_DELAY)) + geom_histogram(bins = 100) + theme_minimal()
+ggplot(flights, aes(x = WHEELS_OFF)) + geom_histogram(bins = 100) + theme_minimal()
+ggplot(flights, aes(x = TAXI_OUT)) + geom_histogram(bins = 100) + theme_minimal()
+ggplot(flights, aes(x = DEP_TIME)) + geom_histogram(bins = 100) + theme_minimal()
+ggplot(flights, aes(x = MONTH)) + geom_histogram(bins = 100) + theme_minimal()
+
+# Bar graph (categorical)
+ggplot(flights, aes(x = YEAR)) + geom_bar() + theme_minimal()
+ggplot(flights, aes(x = DAY)) + geom_bar() + theme_minimal()
+ggplot(flights, aes(x = AIRLINE)) + geom_bar() + theme_minimal()
+ggplot(flights, aes(x = FL_NUMBER)) + geom_bar() + theme_minimal()
+ggplot(flights, aes(x = ORIGIN)) + geom_bar() + theme_minimal()
+ggplot(flights, aes(x = DEST)) + geom_bar() + theme_minimal()
+ggplot(flights, aes(x = DIVERTED)) + geom_bar() + theme_minimal()
+ggplot(flights, aes(x = DELAYED)) + geom_bar() + theme_minimal()
+
+# AIRLINE, ORIGIN, DEST, FL_NUMBER have too many levels
+```
+
+Some things we noticed:
+
+1.  Some of the numeric variables like CRS_ELAPSED_TIME, DEP_DELAY, and TAXI_OUT are heavily right-skewed. Logarithmic or root transformations may be required later on.
+2.  CRS_DEP_TIME, CRS_ARR_TIME, WHEELS_OFF, and DEP_TIME all look *close enough* to being normally distributed, so we probably won't use any transformations on them.
+3.  There are too many categories in FL_NUMBER, ORIGIN, DEST, and AIRLINE. We will consider only using the most popular levels in each.
+4.  DIVERTED essentially has no observations marked as "0". So, we will delete this variable.
+
+Our first step was to delete DIVERTED.
+
+```{r}
+# Delete DIVERTED because it is heavily skewed towards "no"
+flights <- flights %>% dplyr::select(-DIVERTED)
+```
+
+At this point, we realized that flight numbers can be thought of license plates on cars for planes, except each plane is given a unique flight number based on their route. Since we can't really group planes ID's together, we will scrap this variable.
+
+```{r}
+flights <- flights %>% select(-FL_NUMBER)
+```
+
+At first, we decided to only keep the top 10 popular airlines and airports. Unfortunately, it there are still a few airlines that fly a lot and a few airlines that don't fly often in comparison. To make it more even, we will take only the top 4 popular airlines, instead of 10.
+
+```{r}
+keep_top_10 <- function(var) {
+  freq <- table(var)
+  top_levels <- names(sort(freq, decreasing = TRUE)[1:10])
+  as.factor(ifelse(var %in% top_levels, as.character(var), "other"))
+}
+
+flights <- flights %>%
+  mutate(
+    AIRLINE = keep_top_10(AIRLINE),
+    ORIGIN = keep_top_10(ORIGIN),
+    DEST = keep_top_10(DEST)
+  ) %>%
+  filter(
+    AIRLINE != "other",
+    DEST != "other",
+    ORIGIN != "other"
+  ) 
+
+ggplot(flights, aes(x = AIRLINE)) + geom_bar() + theme_minimal()
+ggplot(flights, aes(x = ORIGIN)) + geom_bar() + theme_minimal()
+ggplot(flights, aes(x = DEST)) + geom_bar() + theme_minimal()
+
+# AIRLINE still looks uneven --> just keep the top 4 instead
+
+
+keep_top_4 <- function(var) {
+  freq <- table(var)
+  top_levels <- names(sort(freq, decreasing = TRUE)[1:4])
+  as.factor(ifelse(var %in% top_levels, as.character(var), "other"))
+}
+
+flights <- flights %>%
+  mutate(
+    AIRLINE = keep_top_4(AIRLINE),
+  ) %>%
+  filter(
+    AIRLINE != "other",
+  ) 
+
+ggplot(flights, aes(x = AIRLINE)) + geom_bar() + theme_minimal()
+
+# looks much more even, includes all 3 major U.S. airlines as well
+```
+
+Now that our data is clean, we will take a random sample of 50,000 from the cleaned data. We then split this into a training/testing split, and trained the default model based on the training split.
+
+```{r}
+dim(flights)
+
+# use a small sample of dataset instead
+
+set.seed(12345678)
+index <- sample(nrow(flights), 50000)
+flights_sample <- flights[index, ]
+
+
+# 80/20 training/testing split
+
+set.seed(12345678)
+index2 <- createDataPartition(flights_sample$DELAYED, p = 0.8, list = FALSE)
+train <- flights_sample[index2, ]
+test <- flights_sample[-index2, ]
+
+default_model <- glm(DELAYED ~ ., data = train, family = "binomial")
+summary(default_model)
+```
+
+# Influential Points & Outliers
+
+Now that the data is cleaned and split into training and testing portions, we used Cook's Distance to find our influential points in the training data. We analyzed the possible ranges of these points and determined that all of these are feasible, so we decided to keep all of these observations.
+
+```{r}
+# Influential points
+
+cooks_dist <- cooks.distance(default_model)
+influential_points <- which(cooks_dist > 4 / nrow(train))
+influential_data <- train[influential_points, ]
+
+summary(influential_data)
+
+influential_data %>% 
+  filter(DISTANCE == 2554 | DISTANCE == 226) 
+
+# Long flights are between SEA and MCO  and short flights are between ATL and CLT
+
+influential_data %>% 
+  filter(CRS_DEP_TIME > 1440 | DEP_TIME > 1440, WHEELS_OFF > 1440 | 
+           CRS_ARR_TIME > 1440 | CRS_ELAPSED_TIME > 1440) 
+
+# None of the times are past 1440 minutes past midnight
+
+# Everything looks good!
+```
+
+Our next step was to check for outliers. We decided to use the IQR method of creating the outlier bounds using Q1 - 1.5(IQR) and Q3 + 1.5(IQR). Luckily for us, we did not have any outliers in the training data.
+
+```{r}
+# Outliers
+
+train_num <- train[, sapply(train, is.numeric)]
+outliers <- train_num %>%
+  mutate(row_id = row_number()) %>%
+  rowwise() %>%
+  mutate(outlier = any(across(everything(), ~ {
+    Q1 <- quantile(., 0.25, na.rm = TRUE)
+    Q3 <- quantile(., 0.75, na.rm = TRUE)
+    IQR <- Q3 - Q1
+    . < (Q1 - 1.5 * IQR) | . > (Q3 + 1.5 * IQR)
+  }))) %>%
+  ungroup() %>%
+  filter(outlier) %>%
+  pull(row_id)
+
+outliers
+
+# No outliers!
+```
+
+# Variable Transformation
+
+From the EDA, we saw that some of our numeric variables require transformations. CRS_ELAPSED_TIME and TAXI_OUT are skewed right and consist of positive values, so we applied a logarithmic transformation to them. DEP_DELAY contains negative numbers, so we applied a cube root transformation instead.
+
+```{r}
+train_new <- train %>%
+  # Right skew > 0 -> log()
+  mutate(
+    CRS_ELAPSED_TIME = log(CRS_ELAPSED_TIME),
+    TAXI_OUT = log(TAXI_OUT),
+    DISTANCE = log(DISTANCE),
+  ) %>%
+  # Right-skew with negative #'s -> sign(x) * abs(x)^(1/3)
+  mutate(
+    DEP_DELAY = sign(DEP_DELAY) * abs(DEP_DELAY)^(1/3)
+  )
+
+
+ggplot(train_new, aes(x = CRS_ELAPSED_TIME)) + geom_histogram(bins = 100) + theme_minimal()
+ggplot(train_new, aes(x = TAXI_OUT)) + geom_histogram(bins = 100) + theme_minimal()
+ggplot(train_new, aes(x = DEP_DELAY)) + geom_histogram(bins = 100) + theme_minimal()
+ggplot(train_new, aes(x = DISTANCE)) + geom_histogram(bins = 100) + theme_minimal()
+
+# these look closer to normal now
+# DEP_DELAY is still a little right skewed, but better than before
+```
+
+# Variable Selection
+
+For our variable selection process, we decided to use stepwise selection going both directions, and BIC as our selection criterion. Since we are making an explanatory model, we decided that because BIC is stricter on the number of predictors, our model will have a simpler model that will be easier to explain. Our selected variables were DEP_DELAY, TAXI_OUT, ORIGIN, AIRLINE, WHEELS_OFF, and DEST.
+
+```{r}
+model <- glm(DELAYED ~ ., data = train_new, family = "binomial")
+
+bic_model <- step(glm(DELAYED ~ 1, family="binomial", data=train_new), scope = formula(model), 
+                  direction = "both", trace = 0, k = log(nrow(train_new)))
+
+summary(bic_model)
+```
+
+# Regularization
+
+Our BIC model doesn't appear to be heavily affected by multicollinearity. However, alleviate the effects of overfitting, we still used Ridge Regression. We used the default 10-fold cross validation to find the optimal lambda value for ridge regression, and then we applied ridge regression to the variables selected from the stepwise selection process. Our ridge regression model is our final model.
+
+```{r}
+vif(bic_model)
+
+X <- model.matrix(~ DEP_DELAY + TAXI_OUT + ORIGIN + AIRLINE + DEST + WHEELS_OFF, 
+                  data = train_new)[, -1]
+
+y <- as.numeric(as.character(train_new$DELAYED))
+
+# Ridge Regression
+cv_ridge <- cv.glmnet(X, y, alpha = 0, family = "binomial")
+lambda_ridge <- cv_ridge$lambda.min
+ridge_model <- glmnet(X, y, alpha = 0, family = "binomial", lambda = lambda_ridge)
+
+
+ridge_coefficients <- coef(cv_ridge, s = "lambda.min")
+coef_matrix <- as.matrix(ridge_coefficients)
+ridge_variables <- rownames(coef_matrix)[coef_matrix != 0]
+ridge_variables <- ridge_variables[ridge_variables != "(Intercept)"]
+ridge_variables 
+
+# made up of DEP_DELAY, TAXI_OUT, ORIGIN, DEST, WHEELS_OFF, and AIRLINE
+```
+
+# Comparisons Between Default and Final Models
+
+```{r}
+# First need to transform testing data to match training data
+test_new <- test %>%
+  # Right skew > 0 -> log()
+  mutate(
+    TAXI_OUT = log(TAXI_OUT),
+  ) %>%
+  # Right-skew with negative #'s -> sign(x) * abs(x)^(1/3)
+  mutate(
+    DEP_DELAY = sign(DEP_DELAY) * abs(DEP_DELAY)^(1/3)
+  ) %>% 
+  select(
+    c(DELAYED, DEP_DELAY, TAXI_OUT, ORIGIN, DEST, WHEELS_OFF, AIRLINE)
+  )
+
+X_ridge_test <- model.matrix(~ DEP_DELAY + TAXI_OUT + ORIGIN + AIRLINE + DEST + WHEELS_OFF,
+                             data = test_new)[, -1]
+
+X_ridge_train <- model.matrix(~ DEP_DELAY + TAXI_OUT + ORIGIN + AIRLINE + DEST + WHEELS_OFF, 
+                              data = train_new)[, -1]
+
+# default model predicting the testing data
+pred_default_test <- predict(default_model, test, type = "response")
+confusionMatrix(as.factor(ifelse(pred_default_test > 0.5, 1, 0)), 
+                                       as.factor(test$DELAYED))
+
+# ridge model predicting the testing split
+pred_ridge_test <- predict(ridge_model, X_ridge_test, type = "response")
+confusionMatrix(as.factor(ifelse(pred_ridge_test > 0.5, 1, 0)), 
+                                     as.factor(test_new$DELAYED))
+
+# default model predicting the training split
+pred_default_train <- predict(default_model, train, type = "response")
+confusionMatrix(as.factor(ifelse(pred_default_train > 0.5, 1, 0)), 
+                                       as.factor(train$DELAYED))
+
+# ridge model predicting the training split
+pred_ridge_train <- predict(ridge_model, X_ridge_train, type = "response")
+confusionMatrix(as.factor(ifelse(pred_ridge_train > 0.5, 1, 0)), 
+                                     as.factor(train_new$DELAYED))
+
+c(length(coef(default_model)), length(coef(ridge_model)))
+
+```
+
+Ultimately, our final model's accuracy is lower than the default model on both the training and testing data. However, we believe our final model is easier to interpret as it only has 27 coefficients compared to the default model's 40, while only suffering a 0.0252 decrease in accuracy.
+
+Testing data prediction comparisons (Default vs. Final):
+
+-   **Accuracy**: 0.8652 vs. 0.84
+-   **Sensitivity**: 0.9451 vs. 0.9117
+-   **Specificity**: 0.7198 vs. 0.7096
+-   **Prevalence**: 0.6453 vs. 0.6453
+
+Training data prediction comparisons (Default vs. Final):
+
+-   **Accuracy**: 0.8677 vs. 0.8392
+-   **Sensitivity**: 0.9448 vs. 0.9081
+-   **Specificity**: 0.7276 vs. 0.7138
+-   **Prevalence**: 0.6452 vs. 0.6452
+
+# What can we take away from the final model?
+
+```{r}
+ridge_coefficients <- coef(ridge_model)
+ridge_coeff_matrix <- as.matrix(ridge_coefficients)
+formatted_coeff <- format(ridge_coeff_matrix, digits = 10, scientific = FALSE)
+
+print(formatted_coeff)
+
+# coefficients represent log odds
+```
+
+*For the ORIGIN variable, the reference level is ATL.*
+
+-   If you are departing from the following airports: {DEN, MCO, PHX} then the odds of having a delayed arrival are higher compared to departing from ATL. The origin airport that is attributed with the highest odds of a late arrival is PHX.
+
+-   If you are departing from the following airports: {CLT, DFW, LAS, LAX, ORD, SEA} then the odds of having a delayed arrival are lower compared to departing from ATL. The origin airport that is attributed with the lowest odds of a late arrival is ORD.
+
+*For the DEST variable, the reference level is ATL.*
+
+-   If you are arriving at the following airports: {DEN, DFW, LAS, MCO, ORD, PHX, SEA} then the odds of having a delayed arrival are higher compared to arriving at ATL. The destination airport that is attributed with the highest odds of a late arrival is DEN.
+
+-   If you are arriving at the following airports: {CLT, LAX} then the odds of having a delayed arrival are lower compared to arriving at ATL. The destination airport that is attributed with the lowest odds of a late arrival is LAX.
+
+Overall, it looks like the two best airports that contribute to an on-time arrival schedule are Los Angeles's LAX and Charlotte's CLT. On the other hand, it also seems the worst airports that contribute to a late arrival schedule are Denver's DEN, Orlando's MCO, and Phoenix's PHX.
+
+*For the AIRLINE variable, the reference level is American Airlines.*
+
+-   If you are flying with Southwest Airlines, then the odds of having a late arrival are higher compared to flying with American Airlines.
+
+-   Delta Airlines also has higher odds of a late arrival compared to American Airlines, but because the coefficient of 0.00067 is effectively 0, the change in odds between the two are minimal.
+
+-   United Airlines has the lowest odds of a late arrival compared to the other three airlines.
+
+*Now on to the numeric predictors.*
+
+-   Since TAXI_OUT has the logarithmic transformation applied to it, for a 1-unit increase in log(TAXI_OUT), the log odds of a delayed arrival increases by 1.8639. If we think of it in normal odds, a 1-unit increase in log(TAXI_OUT) multiplies the odds of a delayed arrival by $e^{1.8639} = 6.4488$.
+
+-   Since DEP_DELAY has the cube root transformation applied to it, for a 1-unit increase in cube root of DEP_DELAY, the log odds of delayed arrived increases 0.6144, multiplies the odds of a delayed arrival by $e^{0.6144} = 1.8485$.
+
+-   WHEELS_OFF has no transformation and the coefficient 0.000355 is very close to 0. It has a positive, but mostly negligible effect on the odds.
+
+**Domain Insight**: The most common causes for flight disruptions are bad weather, air traffic control issues, mechanical problems, and crew availability. Does this match our findings? We would argue it does. If certain airports have lousy air traffic control operations, then it would make sense that it might take longer for planes to depart and arrive at these airports. The taxi process also falls under the air traffic control at each airport, and TAXI_OUT has the largest positive magnitude out of all of our coefficients. Our interpretations about ORIGIN, DEST, and TAXI_OUT are consistent with what experts in the commercial aviation field say.
