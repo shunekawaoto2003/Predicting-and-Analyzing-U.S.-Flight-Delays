@@ -2,7 +2,7 @@
 
 ## Description
 
-This project aims to predict whether a U.S. domestic flight will arrive late. The primary motivation is to provide a predictive tool for travelers, especially during peak seasons, to better manage their travel plans, such as connecting flights and ground transportation. The model is developed from the perspective of a passenger who is already on their flight and wants to know if their arrival will be delayed.
+This R project aims to predict whether a U.S. domestic flight will arrive late. The primary motivation is to provide a predictive tool for travelers, especially during peak seasons, to better manage their travel plans, such as connecting flights and ground transportation. The model is developed from the perspective of a passenger who is already on their flight and wants to know if their arrival will be delayed.
 
 The analysis focuses on arrival delay rather than departure delay because a flight's status can change mid-air; a flight that departs on time can still arrive late, and a delayed departure does not always result in a late arrival.
 
